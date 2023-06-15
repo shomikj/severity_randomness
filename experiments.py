@@ -15,11 +15,13 @@ from sklearn.tree import DecisionTreeClassifier
 import warnings
 warnings.filterwarnings('ignore')
 import itertools
+from nonconformist.icp import IcpClassifier
+from nonconformist.nc import ClassifierNc, MarginErrFunc, ClassifierAdapter
 
 
 class Experiment:
 
-    def __init__(self, df, features, protected_attribute, task_types, model_types, random_thresholds, n_train, n_test, random_seed, data_scale):
+    def __init__(self, df, features, protected_attribute, task_types, model_types, random_thresholds, n_train, n_test, random_seed, data_scale, conformal_pred=False):
         self.df = df
         self.features = features
         self.protected_attribute = protected_attribute
@@ -30,8 +32,10 @@ class Experiment:
         self.n_test = n_test
         self.random_seed = random_seed
         self.data_scale = data_scale
+        self.conformal_pred = conformal_pred
 
         self.pretrained_scores = None
+        self.pretrained_pvalues = None
         self.pretrained_partitions = None
 
     def format_data(self, task):
@@ -43,7 +47,7 @@ class Experiment:
         
         return {'X_tr' : X_train, 'X_test' : X_test, 'y_tr': y_train, 'y_test' : y_test, 'z_tr': z_train, 'z_test': z_test}
 
-    def get_partition(self, data, index=None, cal_split=0):
+    def get_partition(self, data, index=None):
         rng = random.Random(self.random_seed)
         if not index:
         	index = rng.randint(0, int(self.data_scale) - 1)
@@ -59,10 +63,14 @@ class Experiment:
         N = len(y_train)
         block_length = int(N // self.data_scale)
 
-        if cal_split>0:
-            train_length = int(block_length * (1-cal_split))
+        if self.conformal_pred:
+            train_length = int(block_length * (0.85))
             train_start, train_end = index * block_length, index * block_length + train_length
             cal_start, cal_end = index * block_length + train_length, index * block_length + block_length
+
+            check = y_train[cal_start : cal_end].sum()
+            if check==0 or check == (cal_end - cal_start):
+                raise RuntimeError("Bad Seed: Only One Class in Calibration Split")
 
             return {'X_tr' : X_train[train_start : train_end], 'X_cal': X_train[cal_start : cal_end], 'X_test' : X_test, 
     	            'y_tr': y_train[train_start : train_end], 'y_cal': y_train[cal_start : cal_end], 'y_test' : y_test, 
@@ -107,11 +115,19 @@ class Experiment:
         scores = [i[1] for i in scores]
         return scores
 
+    def get_conformal_pvalues(self, data, model):
+        icp = IcpClassifier(ClassifierNc(ClassifierAdapter(model), MarginErrFunc()))
+        icp.calibrate(data["X_cal"], data["y_cal"])
+        return icp.predict(data["X_test"], None)
+
     def pretrain_models(self):            
         data_partitions = {}
         risk_scores = {}
+        conformal_pvalues = {}
+
         for task in self.task_types:
             risk_scores[task] = {}
+            conformal_pvalues[task] = {}
             
             data = self.format_data(task)
             partition = self.get_partition(data)
@@ -120,11 +136,15 @@ class Experiment:
             for model_type in self.model_types:
                 print(task, model_type)
                 model = self.train_model(partition, model_type)
-                scores = self.get_risk_scores(partition, model)
-                risk_scores[task][model_type] = scores
+                risk_scores[task][model_type] = self.get_risk_scores(partition, model)
+
+                if self.conformal_pred:
+                    conformal_pvalues[task][model_type] = self.get_conformal_pvalues(partition, model)
 
         self.pretrained_scores = risk_scores
         self.pretrained_partitions = data_partitions
+        if self.conformal_pred:
+            self.pretrained_pvalues = conformal_pvalues
 
     def experiment_baseline(self, num_models=10, iterative=True):
         print("Running Baseline Experiment")
@@ -133,7 +153,8 @@ class Experiment:
             for model_type in self.model_types:
                 models = ModelGroup("baseline", self.random_thresholds, 0, self.data_scale, self.random_seed, model_type, task, self.n_test)              
                 for k in range(num_models):
-                    models.update_metrics(self.pretrained_partitions[task], self.pretrained_scores[task][model_type])
+                    models.update_metrics(self.pretrained_partitions[task], 
+                        self.pretrained_scores[task][model_type], self.pretrained_pvalues[task][model_type])
                     models.update_num_models(k+1)
                     if iterative:
                         results += models.final_metrics()
@@ -151,7 +172,8 @@ class Experiment:
                 for task_group in task_groups:
                     models = ModelGroup("tasks", self.random_thresholds, num_models, self.data_scale, self.random_seed, model_type, task_group, self.n_test)  
                     for task in task_group:
-                        models.update_metrics(self.pretrained_partitions[task], self.pretrained_scores[task][model_type])
+                        models.update_metrics(self.pretrained_partitions[task], 
+                            self.pretrained_scores[task][model_type], self.pretrained_pvalues[task][model_type])
                     results += models.final_metrics()
         return pd.DataFrame([i for res in results for i in res])
 
@@ -164,7 +186,8 @@ class Experiment:
                 for model_group in model_groups:
                     models = ModelGroup("models", self.random_thresholds, num_models, self.data_scale, self.random_seed, model_group, task, self.n_test)  
                     for model_type in model_group:
-                        models.update_metrics(self.pretrained_partitions[task], self.pretrained_scores[task][model_type])
+                        models.update_metrics(self.pretrained_partitions[task], 
+                            self.pretrained_scores[task][model_type], self.pretrained_pvalues[task][model_type])
                     results += models.final_metrics()
         return pd.DataFrame([i for res in results for i in res])
 
@@ -181,8 +204,11 @@ class Experiment:
                     partition = self.get_partition(data, k)
                     model = self.train_model(partition, model_type)
                     risk_scores = self.get_risk_scores(partition, model)
+                    conformal_pvalues = None
+                    if self.conformal_pred:
+                        conformal_pvalues = self.get_conformal_pvalues(partition, model)
 
-                    models.update_metrics(partition, risk_scores)
+                    models.update_metrics(partition, risk_scores, conformal_pvalues)
                     models.update_num_models(k+1)
                     if iterative:
                         results += models.final_metrics()
@@ -214,16 +240,30 @@ class Homogenization:
         
         self.fairness_spd = []
         self.fairness_eop = []
+        self.size = size
 
-    def get_predictions(self, risk_scores):
+    def get_predictions(self, risk_scores, conformal_pvalues=None):
         pred = []
-        for r in risk_scores:
-            if (r > 0.5-self.random_distance) and (r < 0.5+self.random_distance):
-                pred.append(np.random.binomial(1, r))
-            elif (r >= 0.5):
-                pred.append(1)
+        for i in range(self.size):
+            r = risk_scores[i]
+
+            if conformal_pvalues is not None:
+                p = conformal_pvalues[i]
+                if self.random_distance>0 and p[0]>self.random_distance and p[1]>self.random_distance:
+                    pred.append(np.random.binomial(1, r))
+                elif self.random_distance>0 and p[0]<=self.random_distance and p[1]<=self.random_distance:
+                    pred.append(np.random.binomial(1, r))
+                elif (r >= 0.5):
+                    pred.append(1)
+                else:
+                    pred.append(0)
             else:
-                pred.append(0)
+                if (r > 0.5-self.random_distance) and (r < 0.5+self.random_distance):
+                    pred.append(np.random.binomial(1, r))
+                elif (r >= 0.5):
+                    pred.append(1)
+                else:
+                    pred.append(0)
         return np.array(pred)
 
     def get_fairness_metrics(self, partition, pred):
@@ -244,8 +284,8 @@ class Homogenization:
     
         return spd, eod
     
-    def update_metrics(self, partition, scores):
-        pred = self.get_predictions(scores)
+    def update_metrics(self, partition, scores, conformal_pvalues=None):
+        pred = self.get_predictions(scores, conformal_pvalues)
         spd, eop = self.get_fairness_metrics(partition, pred)
         
         self.accuracy.append(np.sum(pred==partition["y_test"])/len(pred))
@@ -307,9 +347,9 @@ class ModelGroup:
             model = Homogenization(exp_type, t, num_models, data_scale, random_seed, model_type, task_type, size)
             self.models.append(model)
         
-    def update_metrics(self, partition, risk_scores):
+    def update_metrics(self, partition, risk_scores, conformal_pvalues=None):
         for m in self.models:
-            m.update_metrics(partition, risk_scores)
+            m.update_metrics(partition, risk_scores, conformal_pvalues)
     
     def update_num_models(self, num_models):
         for m in self.models:
