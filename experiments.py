@@ -21,9 +21,8 @@ from nonconformist.nc import ClassifierNc, MarginErrFunc, ClassifierAdapter
 
 class Experiment:
 
-    def __init__(self, df, features, protected_attribute, task_types, model_types, random_thresholds, n_train, n_test, random_seed, data_scale, conformal_pred=False):
+    def __init__(self, df, protected_attribute, task_types, model_types, random_thresholds, n_train, n_test, random_seed, data_scale, conformal_pred=False):
         self.df = df
-        self.features = features
         self.protected_attribute = protected_attribute
         self.random_thresholds = random_thresholds
         self.task_types = task_types 
@@ -39,9 +38,9 @@ class Experiment:
         self.pretrained_partitions = None
 
     def format_data(self, task):
-        df_train, df_test = sklearn.model_selection.train_test_split(self.df, test_size=0.2, random_state=self.random_seed)
+        df_train, df_test = sklearn.model_selection.train_test_split(self.df[task], test_size=0.2, random_state=self.random_seed)
 
-        X_train, X_test = df_train[self.features].to_numpy(), df_test[self.features].to_numpy()
+        X_train, X_test = df_train.drop(columns=[task, self.protected_attribute]).to_numpy(), df_test.drop(columns=[task, self.protected_attribute]).to_numpy()
         y_train, y_test = df_train[task].to_numpy(), df_test[task].to_numpy()
         z_train, z_test = df_train[self.protected_attribute].to_numpy(), df_test[self.protected_attribute].to_numpy()
         
@@ -140,11 +139,12 @@ class Experiment:
 
                 if self.conformal_pred:
                     conformal_pvalues[task][model_type] = self.get_conformal_pvalues(partition, model)
+                else:
+                    conformal_pvalues[task][model_type] = None
 
         self.pretrained_scores = risk_scores
         self.pretrained_partitions = data_partitions
-        if self.conformal_pred:
-            self.pretrained_pvalues = conformal_pvalues
+        self.pretrained_pvalues = conformal_pvalues
 
     def experiment_baseline(self, num_models=10, iterative=True):
         print("Running Baseline Experiment")
@@ -154,7 +154,7 @@ class Experiment:
                 models = ModelGroup("baseline", self.random_thresholds, 0, self.data_scale, self.random_seed, model_type, task, self.n_test)              
                 for k in range(num_models):
                     models.update_metrics(self.pretrained_partitions[task], 
-                        self.pretrained_scores[task][model_type], self.pretrained_pvalues[task][model_type])
+                            self.pretrained_scores[task][model_type], self.pretrained_pvalues[task][model_type])
                     models.update_num_models(k+1)
                     if iterative:
                         results += models.final_metrics()
@@ -237,9 +237,22 @@ class Homogenization:
         self.systemic_success_inaccurate = (np.ones(size)==1)
         self.systemic_failure_inaccurate = (np.ones(size)==1)
         self.failure_rate_inaccurate = 1
-        
-        self.fairness_spd = []
-        self.fairness_eop = []
+
+        self.pred_pos_0 = []
+        self.pred_pos_1 = []
+
+        self.true_pos_0 = []
+        self.true_pos_1 = []
+
+        self.random_0 = []
+        self.random_1 = []
+
+        self.conf_coverage_0 = []
+        self.conf_coverage_1 = []
+
+        self.conf_set_size_0 = []
+        self.conf_set_size_1 = []
+
         self.size = size
 
     def get_predictions(self, risk_scores, conformal_pvalues=None):
@@ -266,33 +279,56 @@ class Homogenization:
                     pred.append(0)
         return np.array(pred)
 
-    def get_fairness_metrics(self, partition, pred):
+    def update_fairness_metrics(self, partition, pred, risk_scores, conformal_pvalues=None):
         df = pd.DataFrame(partition["z_test"])
         df["y_true"] = partition["y_test"]
         df["y_pred"] = pred
-        
-        m = df[df[0]==1]
-        f = df[df[0]==0]
-        
-        spd = (m["y_pred"].sum()/len(m)) - (f["y_pred"].sum()/len(f))
-        
-        df = df[df["y_true"]==1]
-        m = df[df[0]==1]
-        f = df[df[0]==0]
+        df["risk"] = risk_scores
 
-        eod = (m["y_pred"].sum()/len(m)) - (f["y_pred"].sum()/len(f))
-    
-        return spd, eod
-    
+        if conformal_pvalues is not None:
+            df["p0"] = [p[0] for p in conformal_pvalues]
+            df["p1"] = [p[1] for p in conformal_pvalues]
+
+            df["set_size"] = (df["p0"]>self.random_distance).astype(int) + (df["p1"]>self.random_distance).astype(int)
+            df["coverage"] = ((df["y_true"]==1)*(df["p1"]>self.random_distance)).astype(int) + ((df["y_true"]==0)*(df["p0"]>self.random_distance)).astype(int)
+
+        
+        a = df[df[0]==0]
+        b = df[df[0]==1]
+
+        self.pred_pos_0.append(a["y_pred"].sum()/len(a))
+        self.pred_pos_1.append(b["y_pred"].sum()/len(b))
+
+        if conformal_pvalues is not None:
+            self.conf_coverage_0.append(a["coverage"].sum()/len(a))
+            self.conf_coverage_1.append(b["coverage"].sum()/len(b))
+
+            self.conf_set_size_0.append(a["set_size"].sum()/len(a))
+            self.conf_set_size_1.append(b["set_size"].sum()/len(b))
+
+            self.random_0.append(((a["set_size"]==0).sum() + (a["set_size"]==2).sum())/len(a))
+            self.random_1.append(((b["set_size"]==0).sum() + (b["set_size"]==2).sum())/len(b))
+
+        else:
+            u = 0.5+self.random_distance
+            l = 0.5-self.random_distance
+            self.random_0.append(len(a[(a["risk"]>l)&(a["risk"]<u)])/len(a))
+            self.random_1.append(len(b[(b["risk"]>l)&(b["risk"]<u)])/len(b))
+
+        df = df[df["y_true"]==1]
+
+        a = df[df[0]==0]
+        b = df[df[0]==1]
+
+        self.true_pos_0.append(a["y_pred"].sum()/len(a))
+        self.true_pos_1.append(b["y_pred"].sum()/len(b))
+
     def update_metrics(self, partition, scores, conformal_pvalues=None):
         pred = self.get_predictions(scores, conformal_pvalues)
-        spd, eop = self.get_fairness_metrics(partition, pred)
+        self.update_fairness_metrics(partition, pred, scores, conformal_pvalues)
         
         self.accuracy.append(np.sum(pred==partition["y_test"])/len(pred))
         self.acceptance.append(np.sum(pred)/len(pred))
-        
-        self.fairness_spd.append(spd)
-        self.fairness_eop.append(eop)
         
         self.failure_rate_lockout *= np.sum(pred==0)/len(pred)
         self.systemic_success_lockout *= (pred==1)
@@ -329,9 +365,19 @@ class Homogenization:
 
         r["accuracy"] = np.mean(self.accuracy)
         r["acceptance"] = np.mean(self.acceptance)
-        r["fairness_spd"] = np.mean(self.fairness_spd)
-        r["fairness_eop"] = np.mean(self.fairness_eop)
-        
+
+        r["pred_pos_0"] = np.mean(self.pred_pos_0)
+        r["pred_pos_1"] = np.mean(self.pred_pos_1)
+        r["true_pos_0"] = np.mean(self.true_pos_0)
+        r["true_pos_1"] = np.mean(self.true_pos_1)
+        r["random_0"] = np.mean(self.random_0)
+        r["random_1"] = np.mean(self.random_1)
+
+        r["conf_coverage_0"] = np.mean(self.conf_coverage_0)
+        r["conf_coverage_1"] = np.mean(self.conf_coverage_1)
+        r["conf_set_size_0"] = np.mean(self.conf_set_size_0)
+        r["conf_set_size_1"] = np.mean(self.conf_set_size_1)
+
         r_lockout = self.homogenization_metrics(r.copy(), "lockout",
                         self.systemic_success_lockout, self.systemic_failure_lockout, self.failure_rate_lockout)
 
