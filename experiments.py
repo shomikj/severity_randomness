@@ -17,7 +17,7 @@ warnings.filterwarnings('ignore')
 import itertools
 from nonconformist.icp import IcpClassifier
 from nonconformist.nc import ClassifierNc, MarginErrFunc, ClassifierAdapter
-
+from sklearn.model_selection import KFold
 
 class Experiment:
 
@@ -37,6 +37,8 @@ class Experiment:
         self.pretrained_pvalues = None
         self.pretrained_partitions = None
 
+        random.Random(self.random_seed).shuffle(self.model_types)
+
     def format_data(self, task):
         df_train, df_test = sklearn.model_selection.train_test_split(self.df[task], test_size=0.2, random_state=self.random_seed)
 
@@ -46,10 +48,10 @@ class Experiment:
         
         return {'X_tr' : X_train, 'X_test' : X_test, 'y_tr': y_train, 'y_test' : y_test, 'z_tr': z_train, 'z_test': z_test}
 
-    def get_partition(self, data, index=None):
+    def get_partition(self, data, rows_index=None, features_seed=None, feature_subset=None):
         rng = random.Random(self.random_seed)
-        if not index:
-        	index = rng.randint(0, int(self.data_scale) - 1)
+        if not rows_index:
+        	rows_index = rng.randint(0, int(self.data_scale) - 1)
 
         X_train, y_train, z_train = data['X_tr'], data['y_tr'], data['z_tr']
         X_test, y_test, z_test = data['X_test'], data['y_test'], data['z_test']
@@ -62,24 +64,19 @@ class Experiment:
         N = len(y_train)
         block_length = int(N // self.data_scale)
 
-        if self.conformal_pred:
-            train_length = int(block_length * (0.85))
-            train_start, train_end = index * block_length, index * block_length + train_length
-            cal_start, cal_end = index * block_length + train_length, index * block_length + block_length
+        start, end = block_length * rows_index, block_length * rows_index + block_length
 
-            check = y_train[cal_start : cal_end].sum()
-            if check==0 or check == (cal_end - cal_start):
-                raise RuntimeError("Bad Seed: Only One Class in Calibration Split")
+        if features_seed:
+            ncols = X_train.shape[1]
+            cols = np.arange(ncols)
+            np.random.RandomState(seed=features_seed).shuffle(cols)
+            cols = cols[:int(ncols*feature_subset)]
+            X_train = X_train[:, cols]
+            X_test = X_test[:, cols]
 
-            return {'X_tr' : X_train[train_start : train_end], 'X_cal': X_train[cal_start : cal_end], 'X_test' : X_test, 
-    	            'y_tr': y_train[train_start : train_end], 'y_cal': y_train[cal_start : cal_end], 'y_test' : y_test, 
-    	            'z_tr': z_train[train_start : train_end], 'z_cal': z_train[cal_start : cal_end], 'z_test' : z_test}
-        else:
-            start, end = block_length * index, block_length * index + block_length
-
-            return {'X_tr' : X_train[start : end], 'X_test' : X_test, 
-            		'y_tr': y_train[start : end], 'y_test' : y_test, 
-            		'z_tr': z_train[start: end], 'z_test' : z_test}
+        return {'X_tr' : X_train[start : end], 'X_test' : X_test, 
+        		'y_tr': y_train[start : end], 'y_test' : y_test, 
+        		'z_tr': z_train[start: end], 'z_test' : z_test}
 
     def train_model(self, data, method="logistic"):
         if method == 'logistic':
@@ -119,6 +116,30 @@ class Experiment:
         icp.calibrate(data["X_cal"], data["y_cal"])
         return icp.predict(data["X_test"], None)
 
+
+    def train_conformal_model(self, data, model_type):
+        kf = KFold(n_splits=5, shuffle=False)
+
+        risk_scores = []
+        conformal_pvalues = []
+        for k, (train_idx, cal_idx) in enumerate(kf.split(data["X_tr"])):
+            partition = data.copy()
+            partition["X_tr"] = data["X_tr"][train_idx]
+            partition["X_cal"] = data["X_tr"][cal_idx]
+            partition["y_tr"] = data["y_tr"][train_idx]
+            partition["y_cal"] = data["y_tr"][cal_idx]
+            partition["z_tr"] = data["z_tr"][train_idx]
+            partition["z_cal"] = data["z_tr"][cal_idx]
+
+            model = self.train_model(partition, model_type)
+            risk_scores.append(self.get_risk_scores(partition, model))
+            conformal_pvalues.append(self.get_conformal_pvalues(partition, model))
+
+        risk_scores = np.mean(np.array(risk_scores), axis=0)
+        conformal_pvalues = np.mean(np.array(conformal_pvalues), axis=0)
+
+        return risk_scores, conformal_pvalues
+
     def pretrain_models(self):            
         data_partitions = {}
         risk_scores = {}
@@ -134,13 +155,42 @@ class Experiment:
 
             for model_type in self.model_types:
                 print(task, model_type)
-                model = self.train_model(partition, model_type)
-                risk_scores[task][model_type] = self.get_risk_scores(partition, model)
 
                 if self.conformal_pred:
-                    conformal_pvalues[task][model_type] = self.get_conformal_pvalues(partition, model)
+                    risk_scores[task][model_type], conformal_pvalues[task][model_type] = self.train_conformal_model(partition, model_type)
                 else:
+                    model = self.train_model(partition, model_type)
+                    risk_scores[task][model_type] = self.get_risk_scores(partition, model)
                     conformal_pvalues[task][model_type] = None
+
+        self.pretrained_scores = risk_scores
+        self.pretrained_partitions = data_partitions
+        self.pretrained_pvalues = conformal_pvalues
+
+    def pretrain_diff_models(self, features_subset=(2/3)):
+        data_partitions = {}
+        risk_scores = {}
+        conformal_pvalues = {}
+
+        for task in self.task_types:
+            risk_scores[task] = {}
+            conformal_pvalues[task] = {}
+
+            data = self.format_data(task)
+            k = 0
+            for model_type in self.model_types:
+                print(task, model_type)
+
+                partition = self.get_partition(data, k, k, features_subset)
+                data_partitions[task] = partition               # X_values in partition not important for tracking
+
+                if self.conformal_pred:
+                    risk_scores[task][model_type], conformal_pvalues[task][model_type] = self.train_conformal_model(partition, model_type)
+                else:
+                    model = self.train_model(partition, model_type)
+                    risk_scores[task][model_type] = self.get_risk_scores(partition, model)
+                    conformal_pvalues[task][model_type] = None
+                k += 1
 
         self.pretrained_scores = risk_scores
         self.pretrained_partitions = data_partitions
@@ -177,14 +227,14 @@ class Experiment:
                     results += models.final_metrics()
         return pd.DataFrame([i for res in results for i in res])
 
-    def experiment_models(self):
+    def experiment_models(self, exp_type="models"):
         print("Running Models Experiment")
         results = []
         for task in self.task_types:
             for num_models in range(1, len(self.model_types)+1):
                 model_groups = list(itertools.combinations(self.model_types, num_models))
                 for model_group in model_groups:
-                    models = ModelGroup("models", self.random_thresholds, num_models, self.data_scale, self.random_seed, model_group, task, self.n_test)  
+                    models = ModelGroup(exp_type, self.random_thresholds, num_models, self.data_scale, self.random_seed, model_group, task, self.n_test)  
                     for model_type in model_group:
                         models.update_metrics(self.pretrained_partitions[task], 
                             self.pretrained_scores[task][model_type], self.pretrained_pvalues[task][model_type])
@@ -193,20 +243,25 @@ class Experiment:
 
     def experiment_partitions(self, num_models=5, iterative=True):
         print("Running Data Partitions Experiment")
+        if (self.data_scale < num_models):
+            print("Data scale too small for unique partitions")
+            return
+
         results = []
         for task in self.task_types:
+            data = self.format_data(task)
             for model_type in self.model_types:
                 print(task, model_type)
-                data = self.format_data(task)
 
                 models = ModelGroup("data_partitions", self.random_thresholds, 0, self.data_scale, self.random_seed, model_type, task, self.n_test)            
                 for k in range(num_models):
                     partition = self.get_partition(data, k)
-                    model = self.train_model(partition, model_type)
-                    risk_scores = self.get_risk_scores(partition, model)
-                    conformal_pvalues = None
                     if self.conformal_pred:
-                        conformal_pvalues = self.get_conformal_pvalues(partition, model)
+                        risk_scores, conformal_pvalues = self.train_conformal_model(partition, model_type)
+                    else:
+                        model = self.train_model(partition, model_type)
+                        risk_scores = self.get_risk_scores(partition, model)
+                        conformal_pvalues = None
 
                     models.update_metrics(partition, risk_scores, conformal_pvalues)
                     models.update_num_models(k+1)
@@ -216,6 +271,42 @@ class Experiment:
                 if not iterative:
                     results += models.final_metrics()
         return pd.DataFrame([i for res in results for i in res])
+
+    def experiment_features(self, features_subset=(2/3), num_models=5, iterative=True):
+        print("Running Features Experiment")
+        results = []
+        for task in self.task_types:
+            data = self.format_data(task)
+            for model_type in self.model_types:
+                print(task, model_type)
+
+                models = ModelGroup("features", self.random_thresholds, 0, self.data_scale, self.random_seed, model_type, task, self.n_test)
+                for k in range(num_models):
+                    partition = self.get_partition(data, None, k, features_subset)
+                    if self.conformal_pred:
+                        risk_scores, conformal_pvalues = self.train_conformal_model(partition, model_type)
+                    else:
+                        model = self.train_model(partition, model_type)
+                        risk_scores = self.get_risk_scores(partition, model)
+                        conformal_pvalues = None
+
+                    models.update_metrics(partition, risk_scores, conformal_pvalues)
+                    models.update_num_models(k+1)
+                    if iterative:
+                        results += models.final_metrics()
+                        
+                if not iterative:
+                    results += models.final_metrics()
+        return pd.DataFrame([i for res in results for i in res])
+
+    def experiment_all(self, features_subset=(2/3)):
+        print("Running All Variations Experiment")
+        if (self.data_scale < len(self.model_types)):
+            print("Data scale too small for unique partitions")
+            return
+        self.pretrain_diff_models(features_subset)
+        return self.experiment_models("all")
+
 
 class Homogenization:
     def __init__(self, exp_type, random_distance, num_models, data_scale, random_seed, model_type, task_type, size):
