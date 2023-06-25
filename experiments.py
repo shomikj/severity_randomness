@@ -196,6 +196,24 @@ class Experiment:
         self.pretrained_partitions = data_partitions
         self.pretrained_pvalues = conformal_pvalues
 
+
+    def experiment_risk_scores(self):
+        results = []
+        for task in self.task_types:
+            for model_type in self.model_types:
+                for t in self.random_thresholds:
+                    for i in range(self.n_test):
+                        r = self.pretrained_scores[task][model_type][i]
+                        p = self.pretrained_pvalues[task][model_type][i]
+                        result = {"risk_score": r, "threshold": t, "random": 0}
+
+                        if t>0 and p[0]>t and p[1]>t:
+                            result["random"]=1
+                        elif t>0 and p[0]<=t and p[1]<=t:
+                            result["random"]=1
+                        results.append(result)
+        return pd.DataFrame(results)
+
     def experiment_baseline(self, num_models=10, iterative=True):
         print("Running Baseline Experiment")
         results = []
